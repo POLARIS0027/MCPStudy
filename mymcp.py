@@ -2,11 +2,12 @@
 FastMCP myMcp Server
 """
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 import httpx
 import pandas as pd
 import os
 from dotenv import load_dotenv
+import asyncio 
 
 load_dotenv() # .env 파일에서 환경 변수 로드
 
@@ -186,50 +187,163 @@ def find_ng_items_without_bug_id(xlsx_path: str, sheet_name: str = None) -> list
 
 
 @mcp.tool()
-def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str]) -> str:
+async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx: Context) -> str:
     """
     주어진 시험항목ID들을 참조해 버그 리포트의 초안을 작성하기 위한 데이터를 가져옵니다.
+    LLM을 사용하여 '기대결과'와 '비고'를 바탕으로 개선된 타이틀을 생성합니다.
 
      Args:
         xlsx_path (str): 분석할 Excel 파일 경로
         item_ids(list[str]): 버그 리포트의 초안작성 대상인 시험 항목들의 목록
+        ctx (Context): FastMCP 컨텍스트 객체 (LLM 호출용)
     Returns:
-        report_list: 작성된 초안 리스트
+        report_list: 작성된 초안 리스트 문자열
     """
 
     try:
-        df = pd.read_excel(xlsx_path)
+        # ctx의 메소드들이 대부분 비동기라 비동기로 하는게 나음
+        df = await asyncio.to_thread(pd.read_excel, xlsx_path)
         report_list = []
+        llm_failures = 0 # LLM 호출 실패 횟수
 
         for item_id in item_ids:
             row = df[df["시험항목ID"] == item_id]
             if row.empty:
-                report_list.append(f"⚠️ {item_id} → 데이터 없음\n")
+                report_list.append(f"⚠️ {item_id} → 데이터 없음\\n")
                 continue
 
             row_data = row.iloc[0]
-            report = f"""
-                 **타이틀: 임의작성**
 
-                 **확인내용** 
-                 {row_data['확인내용']}
+            expected_result = row_data.get('기대결과', 'N/A') # .get()으로 키 존재 확인
+            actual_result_notes = row_data.get('비고', 'N/A') # .get()으로 키 존재 확인
+
+            generated_title = f"임의작성" # 기본값 설정
+
+            try:
+                # LLM에게 타이틀 생성 요청
+                prompt = f'''다음 정보를 바탕으로 버그 리포트의 제목을 "기대 결과는 A 였으나 시험 결과는 B였음" 형식으로 간결하게 작성해 주세요:
+
+                기대 결과: {expected_result}
+                실제 결과 또는 비고: {actual_result_notes}
+
+                제목:'''
+                title_response = await ctx.sample(prompt, max_tokens=100) # max_tokens는 적절히 조절
+                generated_title = title_response.text.strip() if title_response.text else generated_title
+
+            except Exception as llm_error:
+                # LLM 호출 실패 시 로그 남기고 기본 타이틀 사용
+                await ctx.warning(f"LLM 제목 생성 실패 (ID: {item_id}): {llm_error}")
+                llm_failures += 1
+                # generated_title은 기본값으로 유지됨
+
+            report = f'''
+                 **타이틀: {generated_title}**
+
+                 **확인내용**
+                 {row_data.get('확인내용', 'N/A')}
 
                  **재현 절차**
-                {row_data['시험순서']}
+                {row_data.get('시험순서', 'N/A')}
 
                  **기대 결과**
-                {row_data['기대결과']}
+                {expected_result}
 
                  **비고**
-                {row_data['비고'] or 'N/A'}
-                
+                {actual_result_notes}
+
                 ・시험 ID : {item_id}
-                ・어플리케이션 버전 : {row_data['어플리케이션 버전']}
-                ・이용단말 : {row_data['이용단말']}
-                ---"""
+                ・어플리케이션 버전 : {row_data.get('어플리케이션 버전', 'N/A')}
+                ・이용단말 : {row_data.get('이용단말', 'N/A')}
+                ---'''
             report_list.append(report)
 
-        return "\n\n".join(report_list)
+        final_report = "\\n\\n".join(report_list) # 줄바꿈 수정
+        if llm_failures > 0:
+             await ctx.warning(f"총 {llm_failures}개의 항목에 대해 LLM 제목 생성에 실패했습니다.")
+
+        return final_report
+
+    except FileNotFoundError:
+        await ctx.error(f"버그리포트 생성 중 오류: 파일을 찾을 수 없습니다 - {xlsx_path}") # 에러 로그 추가
+        return f"❌ 버그리포트 생성 중 오류: 파일을 찾을 수 없습니다 - {xlsx_path}"
+    except KeyError as e:
+         await ctx.error(f"버그리포트 생성 중 오류: Excel 파일에 필요한 컬럼({e})이 없습니다.") # 에러 로그 추가
+         return f"❌ 버그리포트 생성 중 오류: Excel 파일에 필요한 컬럼({e})이 없습니다."
+    except Exception as e:
+        # 오류 발생 시 Context를 통해 로그 남기기 (선택 사항)
+        if ctx: # ctx가 주입되었는지 확인
+             await ctx.error(f"generate_bug_reports_from_ids의 예상치 못한 오류: {e}") # 에러 로그 추가
+        return f"❌ 버그리포트 생성 중 오류: {e}"
+
+EXPECTED_HEADERS = [
+    "시험항목ID", "확인내용", "시험순서", "기대결과",
+    "시험결과", "이용단말", "어플리케이션 버전", "비고", "내부버그DB"
+]
+
+@mcp.tool()
+def add_test_item_to_excel(
+    xlsx_path: str,
+    item_id: str,
+    check_content: str,
+    test_procedure: str,
+    expected_result: str,
+) -> str:
+    """
+    엑셀 파일에 새로운 시험 항목을 추가합니다.
+    '시험결과'는 'NY'로 고정되며, '이용단말', '어플리케이션 버전', '비고', '내부버그DB'는 비워둡니다.
+    파일이 없으면 헤더와 함께 새로 생성합니다.
+
+    Args:
+        xlsx_path (str): 대상 Excel 파일 경로.
+        item_id (str): 추가할 시험항목ID.
+        check_content (str): 추가할 확인내용.
+        test_procedure (str): 추가할 시험순서.
+        expected_result (str): 추가할 기대결과.
+
+    Returns:
+        str: 작업 성공 또는 실패 메시지.
+    """
+    try:
+        df = None
+        # 1. 파일 읽기 시도 (동기)
+        try:
+            df = pd.read_excel(xlsx_path)
+            # 기존 파일 헤더 확인 및 누락된 헤더 추가
+            missing_headers = [h for h in EXPECTED_HEADERS if h not in df.columns]
+            if missing_headers:
+                 for header in missing_headers:
+                     df[header] = pd.NA
+                 df = df[EXPECTED_HEADERS]
+
+        except FileNotFoundError:
+            df = pd.DataFrame(columns=EXPECTED_HEADERS)
+        except Exception as read_error:
+             return f"❌ 파일 읽기 오류: {read_error}"
+
+        # 2. 새로운 데이터 행 생성 (동일)
+        new_data = {
+            "시험항목ID": item_id,
+            "확인내용": check_content,
+            "시험순서": test_procedure,
+            "기대결과": expected_result,
+            "시험결과": "NY",
+            "이용단말": pd.NA,
+            "어플리케이션 버전": pd.NA,
+            "비고": pd.NA,
+            "내부버그DB": pd.NA
+        }
+        new_row_df = pd.DataFrame([new_data])
+
+        # 3. 기존 DataFrame에 새 행 추가 (동일)
+        df = pd.concat([df, new_row_df], ignore_index=True)
+
+        # 4. 수정된 DataFrame을 엑셀 파일로 저장 (동기)
+        try:
+            df.to_excel(xlsx_path, index=False, engine='openpyxl')
+            return f"✅ 시험 항목 '{item_id}' 추가 완료."
+
+        except Exception as write_error:
+            return f"❌ 파일 저장 오류: {write_error}"
 
     except Exception as e:
-        return f"❌ 버그리포트 생성 중 오류: {e}"
+        return f"❌ 처리 중 오류: {e}"
