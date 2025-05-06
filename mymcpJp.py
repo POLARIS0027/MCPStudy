@@ -7,7 +7,7 @@ import httpx
 import pandas as pd
 import os
 from dotenv import load_dotenv
-# import asyncio # 不要になりました
+import asyncio
 
 load_dotenv() # .env ファイルから環境変数をロード
 
@@ -159,16 +159,16 @@ async def add_notion_page(
 @mcp.tool()
 def find_ng_items_without_bug_id(xlsx_path: str, sheet_name: str = None) -> list[str]:
     """
-    xlsxファイルで '試験結果' が 'NG' であり、'内部버그DB' が空の項目の '試験항목ID' をリストで返します。
+    xlsxファイルで '試験結果' が 'NG' であり、'内部バグDB' が空の項目の '試験項目ID' をリストで返します。
     つまり、JIRA に登録されていない項目を通知します。
-    Excelのカラム名は元のファイルに合わせてください（例: '試験結果', '内部버그DB', '試験항목ID'）。
+    Excelのカラム名は元のファイルに合わせてください（例: '試験結果', '内部バグDB', '試験項目ID'）。
 
     Args:
         xlsx_path (str): 分析対象のExcelファイルパス。
         sheet_name (str, optional): 指定されたシート名。省略時は最初のシートを使用。
 
     Returns:
-        list[str]: 条件に一致する試験항목IDの配列。
+        list[str]: 条件に一致する試験項目IDの配列。
     """
 
 
@@ -176,7 +176,7 @@ def find_ng_items_without_bug_id(xlsx_path: str, sheet_name: str = None) -> list
         df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
 
         # 必須カラムの確認 (カラム名はExcelファイルに合わせる)
-        required_columns = ["試ｄID", "시험결과", "내부버그DB"]
+        required_columns = ["試験項目ID", "試験結果", "内部バグDB"]
         for col in required_columns:
             if col not in df.columns:
                 # エラーメッセージを日本語に
@@ -184,11 +184,11 @@ def find_ng_items_without_bug_id(xlsx_path: str, sheet_name: str = None) -> list
 
         # フィルタリング (カラム名はExcelファイルに合わせる)
         filtered = df[
-            (df["시험결과"] == "NG") &
-            (df["내부버그DB"].isnull() | (df["내부버그DB"].astype(str).str.strip() == ""))
+            (df["試験結果"] == "NG") &
+            (df["内部バグDB"].isnull() | (df["内部バグDB"].astype(str).str.strip() == ""))
         ]
 
-        return filtered["시험항목ID"].dropna().astype(str).tolist()
+        return filtered["試験項目ID"].dropna().astype(str).tolist()
 
     except Exception as e:
         # エラーメッセージを日本語に
@@ -200,7 +200,7 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
     """
     指定された 試験項目ID を参照して、バグレポートの下書きを作成するためのデータを取得します。
     LLMを使用して '기대결과' と '비고' を基に改善されたタイトルを生成します。
-    Excelのカラム名は元のファイルに合わせてください（例: '기대결과', '비고', '확인내용' 等）。
+    Excelのカラム名は元のファイルに合わせてください（例: '期待結果', '備考', '確認内容' 等）。
 
      Args:
         xlsx_path (str): 分析対象のExcelファイルパス。
@@ -218,7 +218,7 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
 
         for item_id in item_ids:
             # カラム名はExcelファイルに合わせる
-            row = df[df["시험항목ID"] == item_id]
+            row = df[df["試験項目ID"] == item_id]
             if row.empty:
                 # メッセージを日本語に
                 report_list.append(f"⚠️ {item_id} → データなし\\n")
@@ -227,25 +227,21 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
             row_data = row.iloc[0]
 
             # カラム名はExcelファイルに合わせる
-            expected_result = row_data.get('기대결과', 'N/A') # .get()でキー存在確認
-            actual_result_notes = row_data.get('비고', 'N/A') # .get()でキー存在確認
+            expected_result = row_data.get('期待結果', 'N/A') # .get()でキー存在確認
+            actual_result_notes = row_data.get('備考', 'N/A') # .get()でキー存在確認
 
-            generated_title = f"仮タイトル" # デフォルト値を設定 (日本語)
+            generated_title = f"仮タイトル" # デフォルト値を設定 
 
             try:
-                # LLMにタイトル生成を依頼 (プロンプトを日本語に)
-                prompt = f'''以下の情報に基づいて、バグレポートのタイトルを「期待結果はAだったが、試験結果はBだった」という形式で簡潔に作成してください：
+                # LLMにタイトル生成を依頼 
+                prompt = f'''以下の情報に基づいて、バグレポートのタイトルを「期待結果はAだったが、実際の結果はBだった」という形式で簡潔に作成してください:
 
                 期待結果: {expected_result}
                 実際の結果または備考: {actual_result_notes}
 
                 タイトル:'''
-                # title_response = await ctx.sample(prompt, max_tokens=100) # max_tokens は適切に調整
-                # generated_title = title_response.text.strip() if title_response.text else generated_title
-                # ↑↑↑ 注意: 実際にLLMを使用する場合、ctx.sampleの呼び出しと結果の処理が必要です。
-                #     ここでは日本語化のためコメントアウトしていますが、実際の使用時には元に戻してください。
-                generated_title = f"【仮】期待: {expected_result} / 結果: {actual_result_notes}" # 仮のタイトル生成（LLM呼び出し代替）
-
+                title_response = await ctx.sample(prompt, max_tokens=100) # max_tokens は適切に調整
+                generated_title = title_response.text.strip() if title_response.text else generated_title
 
             except Exception as llm_error:
                 # LLM呼び出し失敗時のログ記録とデフォルトタイトル使用
@@ -258,10 +254,10 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
                  **タイトル: {generated_title}**
 
                  **確認内容**
-                 {row_data.get('확인내용', 'N/A')}
+                 {row_data.get('確認内容', 'N/A')}
 
                  **再現手順**
-                {row_data.get('시험순서', 'N/A')}
+                {row_data.get('試験手順', 'N/A')}
 
                  **期待結果**
                 {expected_result}
@@ -270,8 +266,8 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
                 {actual_result_notes}
 
                 ・試験ID : {item_id}
-                ・アプリケーションバージョン : {row_data.get('어플리케이션 버전', 'N/A')}
-                ・利用端末 : {row_data.get('이용단말', 'N/A')}
+                ・アプリケーションバージョン : {row_data.get('アプリケーションバージョン', 'N/A')}
+                ・利用端末 : {row_data.get('利用端末', 'N/A')}
                 ---'''
             report_list.append(report)
 
@@ -299,8 +295,8 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
 
 # Excelヘッダー定義 (カラム名はExcelファイルに合わせる)
 EXPECTED_HEADERS = [
-    "시험항목ID", "확인내용", "시험순서", "기대결과",
-    "시험결과", "이용단말", "어플리케이션 버전", "비고", "내부버그DB"
+    "試験項目ID", "確認内容", "試験手順", "期待結果",
+    "試験結果", "利用端末", "アプリケーションバージョン", "備考", "内部バグDB"
 ]
 
 @mcp.tool()

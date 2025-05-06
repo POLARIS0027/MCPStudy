@@ -8,6 +8,13 @@ import pandas as pd
 import os
 from dotenv import load_dotenv
 import asyncio 
+import random # Added for random choice
+
+import googleapiclient.discovery
+import googleapiclient.errors
+import re
+from datetime import timedelta
+
 
 load_dotenv() # .env 파일에서 환경 변수 로드
 
@@ -15,6 +22,15 @@ load_dotenv() # .env 파일에서 환경 변수 로드
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("DATABASE_ID")
 NOTION_VERSION = os.getenv("NOTION_VERSION")
+
+
+# --- 유튜브 관련 ---
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+if not YOUTUBE_API_KEY:
+    # API 키가 없으면 경고만 하고 기능은 제한적으로 동작하도록 설정 (선택적)
+    print("Warning: YOUTUBE_API_KEY not found in .env file. YouTube search functionality will be disabled.")
+    # 또는 raise ValueError("오류: .env 파일에서 YOUTUBE_API_KEY를 찾을 수 없습니다.") 로 설정 가능
+
 
 # 환경 변수 로드 확인
 if not NOTION_TOKEN or not DATABASE_ID or not NOTION_VERSION:
@@ -74,7 +90,7 @@ async def read_notion_database() -> str:
                 # 출력 문자열
                 output_lines.append(f"[{date}] {title} - {text}(상태: {status}, 담당자: {assignee})")
 
-            return "\n".join(output_lines) if output_lines else "데이터베이스가 비어 있습니다."
+            return "\\n".join(output_lines) if output_lines else "데이터베이스가 비어 있습니다."
 
         except httpx.HTTPStatusError as e:
             error_details = e.response.text
@@ -143,7 +159,7 @@ async def add_notion_page(
                 error_details = notion_error.get("message", error_details)
             except Exception:
                 pass
-            return (f"❌ 추가 실패! 상태 코드 {e.response.status_code}. 이유: {error_details}\n"
+            return (f"❌ 추가 실패! 상태 코드 {e.response.status_code}. 이유: {error_details}\\n"
                     f"전송된 데이터: {properties_payload}")
         except httpx.RequestError as e:
             return f"❌ 추가 실패! 네트워크 오류: {e}"
@@ -209,7 +225,7 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
         for item_id in item_ids:
             row = df[df["시험항목ID"] == item_id]
             if row.empty:
-                report_list.append(f"⚠️ {item_id} → 데이터 없음\\n")
+                report_list.append(f"⚠️ {item_id} → 데이터 없음\\\\n")
                 continue
 
             row_data = row.iloc[0]
@@ -257,7 +273,7 @@ async def generate_bug_reports_from_ids(xlsx_path: str, item_ids: list[str], ctx
                 ---'''
             report_list.append(report)
 
-        final_report = "\\n\\n".join(report_list) # 줄바꿈 수정
+        final_report = "\\\\n\\\\n".join(report_list) # 줄바꿈 수정
         if llm_failures > 0:
              await ctx.warning(f"총 {llm_failures}개의 항목에 대해 LLM 제목 생성에 실패했습니다.")
 
@@ -347,3 +363,167 @@ def add_test_item_to_excel(
 
     except Exception as e:
         return f"❌ 처리 중 오류: {e}"
+
+# --- BGM 추천 툴 (기존 유지 및 내용 복원) ---
+@mcp.tool()
+async def recommend_bgm_for_summary(
+    emotion_summary: str,
+    ctx: Context
+) -> dict | str:
+    """
+    주어진 감정 요약 문장에 맞는 노래를 유튜브에서 검색하여 iframe 링크와 함께 반환합니다.
+    """
+    try:
+        await ctx.info(f"Searching YouTube BGM for summary: {emotion_summary}")
+
+        # 검색어 수정
+        search_query = f"{emotion_summary} 때 듣는 노래" 
+        await ctx.info(f"YouTube search query: {search_query}")
+
+        # get_youtube_search_result 호출 (video_ids 리스트, message 반환 기대)
+        video_ids, search_result_message = await get_youtube_search_result(search_query, YOUTUBE_API_KEY)
+
+        if not video_ids: # 리스트가 비어있는지 확인
+            error_msg = search_result_message if search_result_message else "알 수 없는 오류"
+            await ctx.error(f"YouTube 검색 실패: {error_msg}")
+            return {
+                 "youtube_iframe": f"YouTube 검색에 실패했습니다: {error_msg}",
+                 "search_query": search_query
+            }
+
+        # 비디오 ID 리스트에서 무작위로 하나 선택
+        selected_video_id = random.choice(video_ids)
+
+        youtube_iframe = f'<iframe width="560" height="315" src="https://www.youtube.com/embed/{selected_video_id}" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>'
+
+        return {
+            "youtube_iframe": youtube_iframe,
+            "search_query": search_query
+        }
+
+    except Exception as e:
+        await ctx.error(f"recommend_bgm_for_summary 오류: {e}")
+        return f"❌ BGM 추천 중 오류 발생: {e}"
+
+# --- 유튜브 관련 함수 (내용 복원 및 유지) ---
+
+def parse_iso8601_duration(duration_str: str) -> int:
+    """Parses ISO 8601 duration string (e.g., PT1H2M3S) and returns total seconds."""
+    if not duration_str or duration_str.startswith('P0'): # Handle missing or zero duration
+        return 0
+    # Relaxed regex to handle variations like PT#M#S or P#DT#H#M#S
+    match = re.match(
+        r'P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?',
+        duration_str
+    )
+    if not match:
+        return 0 # Or raise an error if needed
+
+    parts = match.groupdict()
+    time_params = {}
+    for name, param in parts.items():
+        if param:
+            time_params[name] = int(param)
+
+    # timedelta handles days, hours, minutes, seconds directly
+    return int(timedelta(**time_params).total_seconds())
+
+
+async def get_youtube_search_result(query: str, api_key: str) -> tuple[list[str], str | None]:
+    """
+    주어진 쿼리로 유튜브를 검색하고, 플레이리스트/모음이 아니며
+    영상 길이가 3분 ~ 5분 사이이고 조회수가 1만 이상인 단일 곡으로 추정되는
+    상위 결과들의 비디오 ID 리스트와 오류 메시지를 반환합니다.
+    """
+    if not api_key:
+        return [], "YouTube API 키가 설정되지 않았습니다."
+
+    PLAYLIST_KEYWORDS = ["playlist", "플레이리스트", "모음", "mix", "메들리", "medley", "연속듣기", "collection", "트로트"]
+    MIN_DURATION_SEC = 180 # 3분
+    MAX_DURATION_SEC = 300 # 5분
+    MIN_VIEW_COUNT = 10000 # 1만 조회수
+
+    try:
+        youtube = googleapiclient.discovery.build(
+            "youtube", "v3", developerKey=api_key)
+
+        # 1. 초기 검색 (ID와 제목)
+        search_request = youtube.search().list(
+            part="snippet",
+            q=query,
+            type="video",
+            maxResults=20, # 필터링 위해 결과 수 증가
+            relevanceLanguage="ko"
+        )
+        search_response = await asyncio.to_thread(search_request.execute)
+
+        potential_video_ids = []
+        if search_response.get("items"):
+            for item in search_response["items"]:
+                if item["id"]["kind"] == "youtube#video":
+                    video_id = item["id"]["videoId"]
+                    title = item["snippet"]["title"].lower()
+                    # 2. 플레이리스트 키워드 필터링
+                    is_playlist = any(keyword in title for keyword in PLAYLIST_KEYWORDS)
+                    if not is_playlist:
+                        potential_video_ids.append(video_id)
+
+        if not potential_video_ids:
+            return [], "검색 결과에 플레이리스트가 아닌 비디오가 없습니다."
+
+        # 3. 영상 상세 정보 조회 (길이 및 조회수)
+        final_video_ids = []
+        for i in range(0, len(potential_video_ids), 50):
+            batch_ids = potential_video_ids[i:i+50]
+            try:
+                video_details_request = youtube.videos().list(
+                    part="contentDetails,statistics", # statistics 추가
+                    id=",".join(batch_ids)
+                )
+                video_details_response = await asyncio.to_thread(video_details_request.execute)
+
+                if video_details_response.get("items"):
+                    for item in video_details_response["items"]:
+                        video_id = item["id"]
+                        details = item.get("contentDetails", {})
+                        stats = item.get("statistics", {}) # statistics 정보 가져오기
+
+                        duration_str = details.get("duration")
+                        view_count_str = stats.get("viewCount") # 조회수 문자열
+
+                        if duration_str and view_count_str:
+                            # 4. 길이 필터링
+                            duration_sec = parse_iso8601_duration(duration_str)
+                            if MIN_DURATION_SEC <= duration_sec <= MAX_DURATION_SEC:
+                                # 5. 조회수 필터링
+                                try:
+                                    view_count = int(view_count_str)
+                                    if view_count >= MIN_VIEW_COUNT:
+                                        final_video_ids.append(video_id)
+                                except ValueError:
+                                    # viewCount가 숫자가 아닌 경우 무시
+                                    print(f"Warning: Could not parse view count for video {video_id}: {view_count_str}")
+                                    continue
+
+            except googleapiclient.errors.HttpError as batch_error:
+                 print(f"Error fetching details for batch {i//50 + 1}: {batch_error}")
+                 continue
+
+        # 6. 최종 결과 반환 (최대 5개)
+        if final_video_ids:
+            return final_video_ids[:5], None
+        else:
+            return [], "검색 결과에 조건(3~5분, 1만뷰 이상, 단일 곡)에 맞는 비디오가 없습니다." # 메시지 업데이트
+
+    except googleapiclient.errors.HttpError as e:
+        error_details = f"YouTube API 오류: {e.resp.status}, {e.content.decode('utf-8', 'ignore')}"
+        print(error_details)
+        return [], error_details
+    except Exception as e:
+        print(f"YouTube 검색 중 예상치 못한 오류: {e}")
+        return [], f"YouTube 검색 중 오류 발생: {e}"
+
+
+# 서버 실행 (이 부분은 파일 맨 끝에 있어야 합니다)
+if __name__ == "__main__":
+    mcp.run() 
